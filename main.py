@@ -52,7 +52,7 @@ T = 3.0
 N = int(T / dt)
 
 g = np.array([2.0, 1.0])         # desired goal for point 2
-p1_0 = np.array([-4.0, 4.0])     # initial point 1
+p1_0 = np.array([-2.0, 2.0])     # initial point 1
 p2_0 = np.array([-2.0, -2.0])    # initial point 2
 x0 = np.hstack([p1_0, p2_0])
 
