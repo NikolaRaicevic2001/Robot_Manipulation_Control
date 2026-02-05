@@ -1,15 +1,10 @@
 """
-Toy 2D ADMM-style “shepherding” simulation
+Toy 2D ADMM-style “pushing” simulation (repulsive interaction)
 
-- Particle 1 (x) is actuated (we choose control u).
-- Particle 2 (y) is unactuated; it moves via a short-range attractive force toward a “ghost” trajectory z.
-
-ADMM split (educational / toy):
-    x,u update: quadratic trajectory optimization pulling x toward (z - w) and toward goal.
-    z update: heuristic “best response” that nudges z ahead of y toward the goal while staying close to (x + w).
-    w update: scaled dual update enforcing consensus x ≈ z.
-
-This is intentionally simple and stable (good for learning + tinkering).
+Fixes:
+- Repulsive physics
+- Push-consistent z update
+- NEW: projection to keep x behind y relative to the goal direction
 """
 
 import numpy as np
@@ -18,35 +13,95 @@ from matplotlib import animation
 
 
 # ----------------------------
-# Dynamics: short-range attraction
+# Repulsive interaction model
 # ----------------------------
-def gamma(r: float, k: float = 3.0, sigma: float = 1.0) -> float:
-    """Smooth, bounded gain: strong only when close."""
-    return k * np.exp(-(r * r) / (sigma * sigma))
-
-
-def interaction_force(attractor: np.ndarray, y: np.ndarray, k: float = 3.0, sigma: float = 1.0) -> np.ndarray:
+def interaction_force_repulsive(
+    x: np.ndarray,
+    y: np.ndarray,
+    k: float = 10.0,
+    sigma: float = 2.5,
+    r_cut: float = 2.0,
+) -> np.ndarray:
     """
-    Force pulling y toward attractor (e.g., z or x).
-    F = gamma(||d||) * d, where d = attractor - y.
+    Repulsive force pushing y away from x, ACTIVE ONLY for r < r_cut.
+
+    Uses a smooth compact-support window w(r) that:
+      - w = 1 at r=0
+      - w -> 0 smoothly as r -> r_cut
+      - w = 0 for r >= r_cut
     """
-    d = attractor - y
+    soft = 0.2
+    d = y - x
     r = float(np.linalg.norm(d)) + 1e-12
-    return gamma(r, k=k, sigma=sigma) * d
+    if r >= r_cut:
+        return np.zeros_like(y)
 
+    d_hat = d / r
 
-def rollout_y(y0: np.ndarray, z_traj: np.ndarray, dt: float, k: float = 3.0, sigma: float = 1.0) -> np.ndarray:
-    """
-    Roll out y forward given a fixed z trajectory:
-        y_{t+1} = y_t + dt * F(z_t, y_t)
-    """
+    # Base magnitude (short-range gain + softening)
+    gain = k * np.exp(-(r * r) / (sigma * sigma))
+    mag = gain / (r + soft)
+
+    # Smooth compact-support window: w(r) = (1 - (r/r_cut)^2)^2 for r < r_cut, else 0
+    s = r / r_cut
+    w = (1.0 - s * s) ** 2
+
+    return (w * mag) * d_hat
+
+def rollout_y_repulsive(y0: np.ndarray, z_traj: np.ndarray, dt: float, k: float, sigma: float, r_cut: float) -> np.ndarray:
     T = z_traj.shape[0] - 1
     y = np.zeros_like(z_traj)
     y[0] = y0
     for t in range(T):
-        F = interaction_force(z_traj[t], y[t], k=k, sigma=sigma)
+        F = interaction_force_repulsive(z_traj[t], y[t], k=k, sigma=sigma, r_cut=r_cut)
         y[t + 1] = y[t] + dt * F
     return y
+
+
+def push_target(y: np.ndarray, y_goal: np.ndarray, d_push: float = 1.0) -> np.ndarray:
+    v = y_goal - y
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return y.copy()
+    g_hat = v / n
+    return y - d_push * g_hat
+
+
+def push_target_traj(y_traj: np.ndarray, y_goal: np.ndarray, d_push: float) -> np.ndarray:
+    z_des = np.zeros_like(y_traj)
+    for i in range(y_traj.shape[0]):
+        z_des[i] = push_target(y_traj[i], y_goal, d_push=d_push)
+    return z_des
+
+
+# ----------------------------
+# NEW: "behind-y" projection
+# ----------------------------
+def project_behind_y(x: np.ndarray, y: np.ndarray, y_goal: np.ndarray, margin: float = 0.2) -> np.ndarray:
+    """
+    Enforce (x - y)·g_hat <= -margin. If violated, project x onto the plane behind y.
+    """
+    v = y_goal - y
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return x
+    g_hat = v / n
+
+    s = float(np.dot(x - y, g_hat))  # positive => x is in front
+    if s > -margin:
+        # shift x backward along g_hat so that dot becomes exactly -margin
+        x = x - (s + margin) * g_hat
+    return x
+
+
+def project_traj_behind_y(x_traj: np.ndarray, y: np.ndarray, y_goal: np.ndarray, margin: float = 0.2) -> np.ndarray:
+    """
+    Apply the same behind-y constraint to every x_t using the CURRENT y (toy but effective).
+    """
+    out = x_traj.copy()
+    for t in range(out.shape[0]):
+        out[t] = project_behind_y(out[t], y, y_goal, margin=margin)
+    return out
 
 
 # ----------------------------
@@ -65,24 +120,12 @@ def solve_x_trajectory_quadratic(
     rho: float,
     u_max: float,
 ):
-    """
-    Solve for x_{0:T} minimizing:
-        sum_{t=0}^{T-1} (lam_u/2)||u_t||^2
-      + sum_{t=0}^{T}   (lam_x/2)||x_t - y_goal||^2
-      + sum_{t=0}^{T}   (rho/2)  ||x_t - z_t + w_t||^2
-    subject to:
-        x_{t+1} = x_t + dt u_t
-
-    Eliminate u_t = (x_{t+1}-x_t)/dt -> quadratic in x with tridiagonal structure.
-    Then compute u, clip to bounds, and re-roll x forward to enforce feasibility.
-    """
     T = z_traj.shape[0] - 1
-    n = T  # unknowns are x1..xT (x0 fixed)
-
     if T < 1:
         raise ValueError("horizon_T must be >= 1")
 
-    q = lam_u / (dt * dt)  # coefficient on (x_{t+1}-x_t)^2
+    n = T
+    q = lam_u / (dt * dt)
 
     x_traj = np.zeros((T + 1, 2), dtype=float)
     x_traj[0] = x0
@@ -92,34 +135,26 @@ def solve_x_trajectory_quadratic(
         off = np.zeros(n - 1, dtype=float)
         b = np.zeros(n, dtype=float)
 
-        a = (z_traj[:, dim] - w_traj[:, dim])  # target for x from augmented term
-        g = y_goal[dim]
+        a = (z_traj[:, dim] - w_traj[:, dim])
+        g = float(y_goal[dim])
+        rref = float(y_ref[dim])
 
-        for i in range(n):  # i corresponds to time t = i+1
+        for i in range(n):
             t = i + 1
 
-            # Smoothness term contributions
-            # For x_t:
-            # - if 1 <= t <= T-1: appears in (x_t - x_{t-1})^2 and (x_{t+1}-x_t)^2 -> 2q
-            # - if t == T: appears only in (x_T - x_{T-1})^2 -> q
             diag[i] += 2.0 * q if t < T else 1.0 * q
-
-            # State + augmented penalties
             diag[i] += lam_x + lam_xy + rho
 
-            # RHS: lam_x * goal + rho * (z - w)
-            b[i] += lam_x * g + lam_xy * y_ref[dim]
+            b[i] += lam_x * g
+            b[i] += lam_xy * rref
             b[i] += rho * a[t]
 
-            # Off-diagonals from smoothness coupling with previous/next
             if i > 0:
                 off[i - 1] = -q
 
-            # Contribution of fixed x0 from (x1 - x0)^2
             if t == 1:
-                b[i] += q * x0[dim]
+                b[i] += q * float(x0[dim])
 
-        # Build dense tridiagonal (fine for toy sizes)
         A = np.zeros((n, n), dtype=float)
         np.fill_diagonal(A, diag)
         for i in range(n - 1):
@@ -129,7 +164,6 @@ def solve_x_trajectory_quadratic(
         sol = np.linalg.solve(A, b)
         x_traj[1:, dim] = sol
 
-    # Recover u, clip, and re-roll for feasibility
     u = (x_traj[1:] - x_traj[:-1]) / dt
     u = np.clip(u, -u_max, u_max)
 
@@ -150,29 +184,26 @@ def run_sim(
     y_goal=np.array([2.5, 2.5]),
     dt=0.05,
     horizon_T=25,
-    sim_steps=140,
+    sim_steps=400,
     admm_iters=15,
     # costs
     lam_u=0.3,
-    lam_x=0.5,
-    rho=2.0,
+    lam_x=0.0,
+    lam_xy=10.0,    # stronger push-position tracking
+    rho=0.8,        # reduce consensus domination
     # bounds
     u_max=2.0,
-    # interaction
-    k_force=8.0,
-    sigma_force=3.0,
+    # repulsive interaction
+    k_force=10.0,
+    sigma_force=2.5,
+    r_cut=2.0,
     # z update heuristic strength
-    kappa=0.25,
+    kappa=0.6,
     kappa_power=2.0,
+    # pushing geometry
+    d_push=1.2,
+    behind_margin=0.3,
 ):
-    """
-    Each simulation step:
-      - run admm_iters of ADMM on a horizon of length horizon_T (MPC),
-      - apply first control u0 to x,
-      - update y one step using true interaction with x (not z),
-      - shift warm-start variables.
-    """
-
     x = np.asarray(x0, dtype=float).copy()
     y = np.asarray(y0, dtype=float).copy()
     y_goal = np.asarray(y_goal, dtype=float).copy()
@@ -184,43 +215,54 @@ def run_sim(
     xs = [x.copy()]
     ys = [y.copy()]
 
-    for _step in range(sim_steps):
-        # ADMM iterations on horizon
+    for step in range(sim_steps):
         for _ in range(admm_iters):
+            y_ref = push_target(y, y_goal, d_push=d_push)
+
             # 1) x-update
             x_traj, u_traj = solve_x_trajectory_quadratic(
                 x0=x,
                 z_traj=z_traj,
                 w_traj=w_traj,
                 y_goal=y_goal,
-                y_ref=y,          
+                y_ref=y_ref,
                 dt=dt,
                 lam_u=lam_u,
                 lam_x=lam_x,
-                lam_xy=2.0,      
+                lam_xy=lam_xy,
                 rho=rho,
                 u_max=u_max,
             )
 
-            # 2) z-update heuristic
+            # NEW: ensure x trajectory stays behind y
+            x_traj = project_traj_behind_y(x_traj, y, y_goal, margin=behind_margin)
+
+            # 2) z-update (push-consistent)
             z_bar = x_traj + w_traj
-            y_bar = rollout_y(y0=y, z_traj=z_bar, dt=dt, k=k_force, sigma=sigma_force)
+            y_bar = rollout_y_repulsive(y0=y, z_traj=z_bar, dt=dt, k=k_force, sigma=sigma_force, r_cut=r_cut)
+            z_des = push_target_traj(y_bar, y_goal, d_push=d_push)
 
             weights = (np.linspace(0.0, 1.0, horizon_T + 1) ** kappa_power)[:, None]
-            z_traj = z_bar + kappa * weights * (y_goal - y_bar)
+            z_traj = (1.0 - kappa * weights) * z_bar + (kappa * weights) * z_des
 
-            # 3) dual update (scaled form)
+            # 3) dual update
             w_traj = w_traj + (x_traj - z_traj)
 
-        # Execute MPC action (first control)
+        # Execute MPC action
         u0 = u_traj[0]
         x = x + dt * u0
 
-        # True y update uses interaction with actual x
-        F_true = interaction_force(x, y, k=k_force, sigma=sigma_force)
-        if _step % 20 == 0:
-            print("||F_true|| =", np.linalg.norm(F_true))
+        # NEW: enforce behind constraint at executed state too
+        x = project_behind_y(x, y, y_goal, margin=behind_margin)
+
+        # True y update
+        F_true = interaction_force_repulsive(x, y, k=k_force, sigma=sigma_force, r_cut=r_cut)
         y = y + dt * F_true
+
+        if step % 20 == 0:
+            g_hat = (y_goal - y) / (np.linalg.norm(y_goal - y) + 1e-12)
+            progress = float(np.dot(F_true, g_hat))
+            print("step", step, "progress along goal dir =", progress)
 
         xs.append(x.copy())
         ys.append(y.copy())
@@ -241,20 +283,14 @@ def run_sim(
 # ----------------------------
 # Animation helper (GIF)
 # ----------------------------
-def save_gif(xs, ys, goal, gif_path="admm_shepherding.gif", fps=30, trail=200, dpi=120):
-    """
-    Create an animation of the trajectories and save as a GIF.
-    Requires Pillow: pip install pillow
-    """
-    N = xs.shape[0]
-    if N < 2:
-        raise ValueError(f"Need at least 2 frames to make a GIF, got N={N}.")
-
+def save_gif(xs, ys, goal, gif_path="admm_pushing.gif", fps=30, trail=200, dpi=120):
     xs = np.asarray(xs)
     ys = np.asarray(ys)
     goal = np.asarray(goal)
 
     N = xs.shape[0]
+    if N < 2:
+        raise ValueError(f"Need at least 2 frames to make a GIF, got N={N}.")
     if ys.shape[0] != N:
         raise ValueError("xs and ys must have the same length")
 
@@ -268,7 +304,7 @@ def save_gif(xs, ys, goal, gif_path="admm_shepherding.gif", fps=30, trail=200, d
     ax.set_xlim(mn[0] - pad[0], mx[0] + pad[0])
     ax.set_ylim(mn[1] - pad[1], mx[1] + pad[1])
     ax.grid(True)
-    ax.set_title("ADMM-style shepherding (x actuated → y to goal)")
+    ax.set_title("ADMM-style pushing (x repels y toward goal)")
 
     ax.scatter([goal[0]], [goal[1]], marker="*", s=200, label="goal (y*)")
     ax.scatter([xs[0, 0]], [xs[0, 1]], marker="o", label="x start")
@@ -304,36 +340,24 @@ def save_gif(xs, ys, goal, gif_path="admm_shepherding.gif", fps=30, trail=200, d
         y_dot.set_data([ys[i, 0]], [ys[i, 1]])
 
         link_line.set_data([xs[i, 0], ys[i, 0]], [xs[i, 1], ys[i, 1]])
-
         time_text.set_text(f"t = {i}")
-        return x_trail_line, y_trail_line, x_dot, y_dot, link_line, time_text
 
+        return x_trail_line, y_trail_line, x_dot, y_dot, link_line, time_text
 
     ani = animation.FuncAnimation(
         fig, update, frames=N, init_func=init, blit=True, interval=1000 / fps
     )
 
-    try:
-        writer = animation.PillowWriter(fps=fps)
-    except Exception as e:
-        plt.close(fig)
-        raise RuntimeError(
-            "Failed to create PillowWriter. Install Pillow with: pip install pillow"
-        ) from e
-
+    writer = animation.PillowWriter(fps=fps)
     ani.save(gif_path, writer=writer, dpi=dpi)
     plt.close(fig)
     print(f"Saved GIF to: {gif_path}")
 
 
-# ----------------------------
-# Main
-# ----------------------------
 if __name__ == "__main__":
     xs, ys, goal = run_sim()
-    save_gif(xs, ys, goal, gif_path="admm_shepherding.gif", fps=30, trail=250, dpi=140)
+    save_gif(xs, ys, goal, gif_path="admm_pushing.gif", fps=30, trail=250, dpi=140)
 
-    # Optional static plot
     plt.figure()
     plt.plot(xs[:, 0], xs[:, 1], label="Particle 1 (actuated) path")
     plt.plot(ys[:, 0], ys[:, 1], label="Particle 2 (passive) path")
@@ -343,5 +367,5 @@ if __name__ == "__main__":
     plt.axis("equal")
     plt.grid(True)
     plt.legend()
-    plt.title("ADMM-style shepherding: actuated x moves passive y to goal")
+    plt.title("ADMM-style pushing: x repels y toward goal")
     plt.show()
