@@ -1,27 +1,16 @@
 """
 Toy 2D ADMM-style “pushing” simulation (repulsive interaction)
-
-Fixes:
-- Repulsive physics
-- Push-consistent z update
-- NEW: projection to keep x behind y relative to the goal direction
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import animation
 
+from matplotlib import animation
 
 # ----------------------------
 # Repulsive interaction model
 # ----------------------------
-def interaction_force_repulsive(
-    x: np.ndarray,
-    y: np.ndarray,
-    k: float = 10.0,
-    sigma: float = 2.5,
-    r_cut: float = 2.0,
-) -> np.ndarray:
+def interaction_force_repulsive( x: np.ndarray, y: np.ndarray, k: float = 10.0, sigma: float = 2.5, r_cut: float = 2.0) -> np.ndarray:
     """
     Repulsive force pushing y away from x, ACTIVE ONLY for r < r_cut.
 
@@ -57,7 +46,6 @@ def rollout_y_repulsive(y0: np.ndarray, z_traj: np.ndarray, dt: float, k: float,
         y[t + 1] = y[t] + dt * F
     return y
 
-
 def push_target(y: np.ndarray, y_goal: np.ndarray, d_push: float = 1.0) -> np.ndarray:
     v = y_goal - y
     n = float(np.linalg.norm(v))
@@ -66,13 +54,11 @@ def push_target(y: np.ndarray, y_goal: np.ndarray, d_push: float = 1.0) -> np.nd
     g_hat = v / n
     return y - d_push * g_hat
 
-
 def push_target_traj(y_traj: np.ndarray, y_goal: np.ndarray, d_push: float) -> np.ndarray:
     z_des = np.zeros_like(y_traj)
     for i in range(y_traj.shape[0]):
         z_des[i] = push_target(y_traj[i], y_goal, d_push=d_push)
     return z_des
-
 
 # ----------------------------
 # NEW: "behind-y" projection
@@ -234,7 +220,7 @@ def run_sim(
                 u_max=u_max,
             )
 
-            # NEW: ensure x trajectory stays behind y
+            # Ensure x trajectory stays behind y
             x_traj = project_traj_behind_y(x_traj, y, y_goal, margin=behind_margin)
 
             # 2) z-update (push-consistent)
@@ -252,7 +238,7 @@ def run_sim(
         u0 = u_traj[0]
         x = x + dt * u0
 
-        # NEW: enforce behind constraint at executed state too
+        # Ensure x stays behind y relative to the goal direction
         x = project_behind_y(x, y, y_goal, margin=behind_margin)
 
         # True y update
@@ -344,10 +330,7 @@ def save_gif(xs, ys, goal, gif_path="admm_pushing.gif", fps=30, trail=200, dpi=1
 
         return x_trail_line, y_trail_line, x_dot, y_dot, link_line, time_text
 
-    ani = animation.FuncAnimation(
-        fig, update, frames=N, init_func=init, blit=True, interval=1000 / fps
-    )
-
+    ani = animation.FuncAnimation(fig, update, frames=N, init_func=init, blit=True, interval=1000 / fps)
     writer = animation.PillowWriter(fps=fps)
     ani.save(gif_path, writer=writer, dpi=dpi)
     plt.close(fig)
@@ -356,7 +339,7 @@ def save_gif(xs, ys, goal, gif_path="admm_pushing.gif", fps=30, trail=200, dpi=1
 
 if __name__ == "__main__":
     xs, ys, goal = run_sim()
-    save_gif(xs, ys, goal, gif_path="admm_pushing.gif", fps=30, trail=250, dpi=140)
+    save_gif(xs, ys, goal, gif_path="results/admm_pushing.gif", fps=30, trail=250, dpi=140)
 
     plt.figure()
     plt.plot(xs[:, 0], xs[:, 1], label="Particle 1 (actuated) path")

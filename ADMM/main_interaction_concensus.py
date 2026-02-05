@@ -10,20 +10,11 @@ Goal:
 - ONLY task cost: 0.5 * || y_T - y_goal ||^2
 - Use ADMM with consensus x_t = z_t, where z_t is the "ghost" interaction center.
 
-Key fix:
-- If f has a HARD cutoff (exactly zero outside r_cut), gradients can be exactly zero
-  when x/z are far from y, so z-update stalls forever.
-- Solution: use a PLANNING force with a tiny smooth "tail" outside r_cut for the z-update
-  (so gradients exist), but keep TRUE physics hard-cutoff for the actual simulation.
-
 ADMM per MPC step:
   1) x-update: quadratic solve (fast) to match z - w with tiny control regularizer
   2) z-update: gradient steps on [0.5||y_T(z)-goal||^2 + (rho/2)||z-(x+w)||^2]
                using adjoint gradients through y dynamics with PLANNING force
   3) w-update: w <- w + (x - z)
-
-Requires: numpy, matplotlib, pillow
-  pip install numpy matplotlib pillow
 """
 
 import numpy as np
@@ -196,9 +187,7 @@ def solve_x_update(x0, z_traj, w_traj, dt, rho, eps_u, u_max):
 # =============================================================================
 # z-update: adjoint gradient descent through y dynamics (PLANNING force)
 # =============================================================================
-def rollout_y_and_adjoint_grad(
-    z_traj, y0, y_goal, dt, rho, x_plus_w, k_force, sigma_force, r_cut, tail, tail_sigma
-):
+def rollout_y_and_adjoint_grad(z_traj, y0, y_goal, dt, rho, x_plus_w, k_force, sigma_force, r_cut, tail, tail_sigma):
     """
     J(z) = 0.5||y_T(z)-y_goal||^2 + (rho/2) Σ ||z_t - x_plus_w_t||^2
 
@@ -217,9 +206,7 @@ def rollout_y_and_adjoint_grad(
 
     # forward rollout
     for t in range(T):
-        f, Jy, Jz = repulsive_force_and_jacobians_planning(
-            z_traj[t], y[t], k=k_force, sigma=sigma_force, r_cut=r_cut, tail=tail, tail_sigma=tail_sigma
-        )
+        f, Jy, Jz = repulsive_force_and_jacobians_planning(z_traj[t], y[t], k=k_force, sigma=sigma_force, r_cut=r_cut, tail=tail, tail_sigma=tail_sigma)
         Jy_list.append(Jy)
         Jz_list.append(Jz)
         y[t + 1] = y[t] + dt * f
@@ -335,17 +322,14 @@ def run_sim_admm(
         x = x + dt * u0
 
         # TRUE y update uses HARD-cutoff physics
-        f_true, _, _ = repulsive_force_and_jacobians_true(
-            x, y, k=k_force, sigma=sigma_force, r_cut=r_cut
-        )
+        f_true, _, _ = repulsive_force_and_jacobians_true(x, y, k=k_force, sigma=sigma_force, r_cut=r_cut)
         y = y + dt * f_true
 
         xs.append(x.copy())
         ys.append(y.copy())
 
         if step % 25 == 0:
-            print("step", step, "||y-goal|| =", np.linalg.norm(y - y_goal),
-                  "| ||x-y|| =", np.linalg.norm(x - y))
+            print("step", step, "||y-goal|| =", np.linalg.norm(y - y_goal), "| ||x-y|| =", np.linalg.norm(x - y))
 
         # shift warm starts
         x_traj[:-1] = x_traj[1:]
@@ -424,7 +408,7 @@ def save_gif(xs, ys, goal, gif_path="admm_consensus_tail.gif", fps=30, trail=250
 if __name__ == "__main__":
     xs, ys, goal = run_sim_admm(
         horizon_T=35,
-        sim_steps=250,
+        sim_steps=500,
         admm_iters=10,
         rho=2.0,
         eps_u=5e-3,
@@ -439,7 +423,7 @@ if __name__ == "__main__":
         warm_bias=0.3,
     )
 
-    save_gif(xs, ys, goal, gif_path="admm_consensus_tail.gif", fps=30, trail=250, dpi=140)
+    save_gif(xs, ys, goal, gif_path="results/admm_consensus_tail.gif", fps=30, trail=250, dpi=140)
 
     plt.figure()
     plt.plot(xs[:, 0], xs[:, 1], label="x path")
